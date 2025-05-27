@@ -1,7 +1,6 @@
 This repository contains data and analysis scripts for the manuscript:
 
 ## Electrochemically Induced Alkalinity Enhancement Increases Coral Growth Rates in the Local Microenvironment
-Supporting data and scripts for manuscript, 'Electrochemically induced alkalinity enhancement increases coral growth rates in the local microenvironment'.
 
 #### **Authors**: Patrick M. Kiel, Matthew McConnell, Albert Boyd, Nash Soderberg, Prannoy Suraneni, Vivek N. Prakash, and Ian C. Enochs
 #### **Journal**: _Under revision_ []()
