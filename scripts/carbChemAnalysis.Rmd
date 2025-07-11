@@ -1,0 +1,275 @@
+---
+title: "Carbonate Chemistry Analysis"
+output: html_notebook
+---
+
+
+```{r, load-packages}
+library(tidyverse)
+library(seacarb)
+library(lme4)
+library(lmerTest)
+library(lsmeans)
+library(multcompView)
+library(rstatix)
+```
+
+# Acer Growth Experiment
+
+```{r, branching-corals}
+# load data
+branchData <- read_csv('../data/acerExperiment/eAEacerCarbChem.csv')
+
+# wide stats table
+branchData %>%
+  pivot_wider(names_from = "variable",
+              values_from = "value") -> branchWide
+branchWide %>%
+    rename(`temperature` = temp.ERL,
+         `pH measured` = pH.ERL,
+         salinity = sal,
+         DIC = dic,
+         TA = ta,
+         `spec pH` = spec_pHCorrected,
+         `seacarb pH` = ph_calc,
+         `Omega`=`OmegaAragonite`) %>%
+  group_by(tank) %>%
+  summarise(across(temperature:Omega, ~paste(signif(mean(.x, na.rm=T),4),
+                                             "+/-",
+                                             signif(sd(.x,na.rm=T),4)))) #%>%
+  #write.table("clipboard",sep="\t",row.names=F)
+  
+
+# stats between tank and loop
+branchData %>%
+  drop_na() -> branchData
+
+# dependent values normally distirbuted?
+# approximatey normal except for Temp because loop temp is very different than the precily controlled aquarium temp. we'll leave temp out of the stat analysis
+ggplot(branchData, aes(sample = value)) +
+  stat_qq() + 
+  stat_qq_line() +
+  facet_wrap(~variable, scales = "free") +  # Separate plots for each group
+  theme_minimal() +
+  labs(title = "QQ Plots for Each Variable", x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+# homoscedasticity 
+# all good except for tempt
+branchData %>%
+  group_by(variable) %>%
+  levene_test(value ~ tank)
+
+branchData %>%
+  filter(type != 'loop' & variable=='temp.ERL') %>%
+  group_by(variable) %>%
+  levene_test(value ~ tank)
+
+# mixed effect anova
+branchData %>%
+  filter(variable != "pH.ERL") %>%
+  group_by(variable) %>%
+  nest() %>%
+  mutate(mod = map(data, ~lmer(value~type + (1|tank),
+                               data = .x)),
+         #p_value = map(mod, ~summary(.x)$coefficients[2,5]),
+         marginal = map(mod, ~lsmeans(.x,~ type)),
+         pairs = map(marginal, ~pairs(.x, adjust="tukey")),
+         pairs_pValue = map(pairs, function(dat) {
+                                     dat %>%
+                                      broom::tidy() %>%
+                                      pull(p.value)})) %>%
+  unnest(pairs_pValue) -> temp
+
+temp %>%
+  filter(pairs_pValue < 0.05)
+
+branchData %>%
+  filter(variable != "pH.ERL") %>%
+  lmer(value~type*variable + (1|type:tank),
+        data = .) -> mod
+
+summary(mod)
+anova(mod)
+marginal = emmeans(mod,
+                   ~ type*variable)
+
+pairs(marginal, adjust="tukey") %>%
+  broom::tidy() %>%
+  filter(str_detect(contrast, "loop (\\S+) - tank \\1")) %>%
+  filter(adj.p.value < 0.05)
+
+# What if i do glmm?
+
+# proceed with GLMM
+glmm_model <- branchData %>%
+  filter(variable != "pH.ERL") %>% 
+  glm(value ~ type*variable,
+        data = .,
+        family = Gamma(link = "log"))
+
+summary(glmm_model)
+
+# glmm post hoc
+posthoc_glht <- emmeans(glmm_model, pairwise ~ type*variable, adjust = "Tukey")
+
+# Print results
+data.frame(summary(posthoc_glht)$contrasts) %>%
+  drop_na(estimate) %>%
+  filter(str_detect(contrast, "^(?=.*? (\\S+) - .*? \\1).*")) %>%
+  filter(p.value < 0.05) %>%
+  select(1,6)
+
+# stats between tanks
+branchData %>%
+  filter(type=="tank") %>%
+  aov(value ~ tank*variable,
+       data = .) -> mod
+
+summary(mod)
+data.frame(TukeyHSD(mod)[[3]]) %>%
+  rownames_to_column(var = "contrast") %>%
+  filter(str_detect(contrast, "T\\d+:(\\S+)-T\\d+:\\1")) %>%
+  pull(p.adj) %>%
+  min(.) # all contrasts p>0.999999, so no differences among aquariums
+
+```
+
+# Microfrags
+
+```{r, microfrags}
+# load data
+microfragData <- read_csv('../data/microfragExperiment/eAEpclivCarbChem.csv') %>%
+  mutate(ymd = parse_date(ymd, format="%m/%d/%Y"))
+
+# wide means table
+microfragData %>%
+  drop_na() %>%
+  pivot_wider(names_from = "variable",
+              values_from = "value") -> microfraghWide
+
+microfraghWide %>%
+  select(-ph_calc) %>%
+    rename(`temperature` = temp.ERL,
+         TA = ta,
+         `pH` = spec_pHCorrected,
+         `Omega`=`OmegaAragonite`) %>%
+  group_by(tank) %>%
+  summarise(across(temperature:Omega, ~paste(signif(mean(.x, na.rm=T),5),
+                                             "+/-",
+                                             signif(sd(.x,na.rm=T),4)))) #%>%
+  #write.table("clipboard",sep="\t",row.names=F)
+  
+# stats between treatments/tanks
+microfragData %>%  
+  drop_na() -> microfragData
+
+# all approximately normal
+ggplot(microfragData, aes(sample = value)) +
+  stat_qq() + 
+  stat_qq_line() +
+  facet_wrap(~variable, scales = "free") +  # Separate plots for each group
+  theme_minimal() +
+  labs(title = "QQ Plots for Each Variable", x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+# homoscedasticity 
+# all good
+microfragData %>%
+  group_by(variable) %>%
+  levene_test(value ~ tank)
+
+# treatment
+microfragData %>%
+  lmer(value ~ treatment*variable + (1|treatment:tank),
+       data = .) -> mod
+
+anova(mod)
+summary(mod)
+marginal = lsmeans(mod,
+                   ~ treatment*variable)
+pairs(marginal, adjust="tukey") %>%
+  broom::tidy() %>%
+  filter(str_detect(contrast, "control (\\S+) - eAE \\1"))
+
+
+# individual tanks
+microfragData %>%
+  aov(value ~ tank*variable,
+       data = .) -> mod
+
+summary(mod)
+data.frame(TukeyHSD(mod)[[3]]) %>%
+  rownames_to_column(var = "contrast") %>%
+  filter(str_detect(contrast, "TT[A-Z0-9]+:(\\S+)-TT[A-Z0-9]+:\\1")) %>%
+  arrange(p.adj) # all contrasts p>0.225, so no differences among aquariums
+
+```
+
+# Combine the two experiments and test. 
+```{r}
+combinedDat <- microfragData %>%
+  drop_na() %>%
+  mutate(experiment = "microfrag") %>%
+  bind_rows(branchData %>%
+              filter(type=="tank") %>%
+              select(-type) %>%
+              drop_na() %>%
+              mutate(experiment = "branching",
+                     treatment = 'eAE'))
+
+# rename + clean 
+combinedDat %>%
+  mutate(variable = case_when(variable == 'dic' ~ 'DIC',
+                              variable == 'sal' ~ 'salinity',
+                              T ~ variable)) %>%
+  filter(variable!='pH.ERL') %>%
+    drop_na() -> combinedDat # durafet pH not collected for microfrag study
+
+# check names are alligned
+unique(combinedDat$variable)
+unique(combinedDat$treatment)
+
+# check for anova assumptions
+
+# temp is a bit skewed, everything else okay
+ggplot(combinedDat, aes(sample = value)) +
+  stat_qq() + 
+  stat_qq_line() +
+  facet_wrap(~variable, scales = "free") +  # Separate plots for each group
+  theme_minimal() +
+  labs(title = "QQ Plots for Each Variable", x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+# homoscedasticity 
+# CO3, DIC, HCO3, Omega, spec pH, temp all do not work
+combinedDat %>%
+  group_by(variable) %>%
+  levene_test(value ~ experiment) %>%
+  filter(p<0.05)
+
+# test with GLMM for fun, can probably stick with lmer based on the above assumptions
+glmm_model <- combinedDat %>% 
+  glmer(value ~ experiment*variable + (1|treatment:tank),
+        data = .,
+        family = Gamma(link = "log"))
+
+summary(glmm_model)
+anova(glmm_model)
+
+# glmm post hoc
+posthoc_glht <- emmeans(glmm_model, pairwise ~ experiment*variable, adjust = "Tukey")
+
+# Print results
+data.frame(summary(posthoc_glht)$contrasts) %>%
+  #drop_na(estimate) %>%
+  filter(str_detect(contrast, "^(?=.*? (\\S+) - .*? \\1).*")) %>%
+  filter(p.value < 0.05)
+
+# what are these actual differences?
+combinedDat %>%
+  group_by(experiment, variable) %>%
+  summarise(mean_value = mean(value, na.rm=T),
+            sd_value = sd(value, na.rm=T)) %>%
+  ungroup() %>%c()
+  pivot_wider(names_from = "experiment",
+              values_from = "mean_value") %>%
+  mutate(diff = branching - microfrag)
+```

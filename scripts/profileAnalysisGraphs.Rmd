@@ -1,0 +1,919 @@
+---
+title: "Microprofile Analysis and Graphs"
+output: html_notebook
+---
+
+```{r, load-libraries}
+library(tidyverse)
+library(seacarb)
+library(minpack.lm)
+
+```
+
+```{r, load-data}
+jProfiles <- read_csv("../data/pHProfiles/currentDensityProfiles.csv")
+flowProfiles <- read_csv("../data/pHProfiles/flowProfiles.csv")
+# J = current density in A/m2
+# v = flume bulk velocity in cm/s
+# substrate = inert (control) / eAE 
+# replicate = 3 runs per profile
+# z = height above substrate in microns
+# pH_T_avg = average station reading recentered to bulk values (pH=8.02), measured in pHnbs and converted to total scale using seacarb
+# H_avg = pH_T_avg (total scale) converted to [H+] in nM
+```
+
+# Current Density Profiles
+
+## Plot
+
+```{r}
+jProfiles %>%
+  mutate(J = case_when(substrate == "inert" ~ 0,
+                       T ~ J),
+         substrate = as.factor(substrate)) -> jProfiles
+jProfiles$J = factor(jProfiles$J, levels = c("0", "0.5", "1", "3"))
+jProfiles %>%  
+  ggplot(aes(z, pH_T_avg, color=J, shape = substrate)) +
+  stat_summary(
+    fun = mean, 
+    fun.min = \(x) mean(x) - sd(x), 
+    fun.max = \(x) mean(x) + sd(x),
+    geom = "pointrange") +
+  stat_summary(
+    fun = mean,
+    geom = "line"
+  ) +
+  geom_vline(xintercept = c(10305.15, 14644.82,  21189.76), linetype="dashed",
+             color = c("#66C2A5","#FC8D62","#8DA0CB"), linewidth=0.75) + #dbl heights calculated below
+  annotate(geom="rect",
+    xmin = c(10305.15 - 823.2307, 14644.82 - 848.4919,  21189.76 - 676.8799),   
+    xmax = c(10305.15 + 823.2307, 14644.82 + 848.4919,  21189.76 + 676.8799), 
+    ymin = -Inf,
+    ymax = Inf,
+    fill = c("#66C2A5","#FC8D62","#8DA0CB"),
+    alpha=0.3) +
+  theme_bw() +
+  theme_bw() +
+  labs(x = "Height (mm)",
+       y = bquote(bold(pH[T])),
+       color = expression("Current Density, " ~ J ~ "("*A~m^-2*")"),
+       shape = "Substrate") +
+  scale_color_manual(values =c("0"="#000",
+                               "0.5"="#66C2A5",
+                               "1"="#FC8D62",
+                               "3"="#8DA0CB"),
+                     breaks = c("0", "0.5", "1", "3")) + 
+  guides(shape = guide_legend(override.aes = list(linetype = 0)),
+         color = guide_legend(breaks = c("0", "0.5", "1", "3"))) +
+  scale_x_continuous(labels = function(x) x / 1000) +
+theme(legend.position = "bottom",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+ggsave('../figures/currentDensityBoundaryLayer_alt.tiff',
+       dpi = 600,
+       width = 8,
+       height = 4,
+       units = "in",
+       device = "tiff",
+       compression = "lzw")
+```
+
+## Boundary Layer Calculations
+3 methods:
+1) 99% of H+
+2) <10% different 4 consecutive times
+3) Intersection of profile w/ hyperbolic tangent model
+
+**Only method #3 used for manuscript**
+
+```{r}
+# function for dbl calc 2
+# consecutive_method <- function(vec, z, threshold = 0.1, n = 4) {
+#     # vec = vector of numbers iterated over
+#     # threshold = % difference between neighboring values
+#     # n = required number of consecutive values below the threshold
+#   
+#   # make all the pH > 8.25 NA since very rapid decrease then plateud changes in pH
+#   # vec = ifelse(vec < 10^(-8.25), NA, vec)
+#     
+#   changes = abs(vec - lag(vec)) / lag(vec)  # percentage change
+#   within_threshold = changes <= threshold  # % change <= threshold
+# 
+#   # Find the first sequence of > n consecutive TRUEs
+#   consec_count = rle(within_threshold)  # Run-length encoding
+#   valid_indices = which(consec_count$values & consec_count$lengths >= n)
+#   
+#     if (length(valid_indices) > 0) {
+#     return(z[sum(consec_count$lengths[1:(valid_indices[1]-1)])+4]) 
+#     } else {
+#     return(NA) # Return NA if no valid sequence found
+#   }
+# }
+
+# hyberbolic tangent intersection method, adapted from Nishihara and Ackerman (2007)
+htanIntersecton <- function(dat, pH_filt=8.25) {
+  dat = dat %>%
+    mutate(z_norm = (z-min(z))/(max(z)-min(z))) %>% # scale z between 0 to 1
+    filter(pH_T_avg < pH_filt) # remove the initial steps w/ rapidly decreasing pH to improve model fit
+
+# Define the hyperbolic tangent model function  
+  # tanh_model = function(par, depth) {
+  #   A = par[1]  # Scaling factor
+  #   B = par[2]  # Transition depth
+  #   C = par[3]  # Steepness
+  #   D = par[4]  # Offset
+  #   A * tanh(C * (depth - B)) + D
+  # }
+
+# Initial parameter estimates (adjust as needed)
+start_params = c(A = max(dat$H_avg)-min(dat$H_avg),
+                 B = dat$z_norm[which.min(abs(dat$H_avg - median(dat$H_avg)))],
+                 C = 0.1,
+                 D = min(dat$H_avg))
+
+# Fit the model
+fit <- tryCatch({
+      nlsLM(H_avg ~ A * tanh(C * (z_norm - B)) + D,
+            data = dat,
+            start = as.list(start_params),
+            control = list(maxiter = 1000))
+    }, 
+    error = function(e) {
+      profile_name <- if('v' %in% names(dat)) {
+        paste0("Velocity = ", unique(dat$v), "; J = ", unique(dat$J), "; replicate = ", unique(dat$replicate))
+      } else {
+        paste0("J = ", unique(dat$J), "; replicate = ?")
+      }
+      message("Fit failed for profile: ", profile_name)
+      message("Error: ", e$message)
+      return(NULL)
+    })
+
+if(!is.null(fit)) {
+# Extract fitted parameters
+params = coef(fit)
+
+# Generate fitted values for intersection
+dat$fitted = params[1] * tanh(params[3] * (dat$z_norm - params[2])) + params[4]
+
+# Identify the boundary layer height (where fitted profile meets the constant part)
+asymptote = mean(tail(dat$fitted, n = 2))  # Assumed bulk concentration
+threshold = asymptote * 0.99 # set limit to 99% of this bulk concentration 
+boundary_height_data = max(dat$z[dat$fitted <= threshold])  # extract max z below threshold
+
+# modeled height
+boundary_height_model = data.frame(
+  z_norm = seq(0,1,length.out=2000) # generates 2000 even steps across profile
+) %>%
+  mutate(z= z_norm*25000, # convert back to um for a 2.5cm profile
+         modeled_values = params[1] * tanh(params[3] * (z_norm - params[2])) + params[4]) %>% # calculate the fitted values
+  filter(modeled_values <=threshold) %>%
+  pull(z) %>% max() # identify boundary layer before constant part of model
+
+return(data.frame(dbl_model = boundary_height_model,
+         dbl_data = boundary_height_data))
+}
+else{
+  return(c(NA,
+           NA))
+}
+}
+
+# analyzeProfile <- function(profile) {
+#   # 99% method
+#   # grab last 5 [H+], calculate when profile hits 99% of this
+#   # target_99 = mean(tail(profile$H_avg),na.rm = T)*0.99
+#   # dbl_99 = profile$z[which.max(profile$H_avg[profile$H_avg < target_99])]
+#   # 
+#   # # <10% different 4 consecutive times
+#   # dbl_consecutive = consecutive_method(vec = profile$H_avg,
+#   #                                      z = profile$z,
+#   #                                      threshold = 0.1)
+#   
+#   # hyperbolic tangent method
+#   dbl_htan = htanIntersecton(profile)
+#   
+#   return(tibble(#dbl_99 = dbl_99,
+#                  #dbl_consecutive = dbl_consecutive,
+#                  dbl_htanmodel = dbl_htan[1],
+#                  dbl_htandata = dbl_htan[2]))
+# }
+
+jProfiles %>%
+  filter(substrate=="eAE") %>%
+  group_by(date, J, substrate, replicate) %>%
+  nest() %>%
+  mutate(dbl = map(data, ~htanIntersecton(.x))) %>%
+  unnest(dbl) %>%
+  pivot_longer(cols = dbl_model:dbl_data,
+               names_prefix = "dbl_",
+               names_to = "method",
+               values_to = "dbl")  -> jProfiles_dbl
+jProfiles_dbl %>%
+  group_by(J, method) %>%
+  filter(method == "model") %>%
+  summarise(mean = mean(dbl, na.rm = T),
+            sd = sd(dbl, na.rm =T),
+            n = n(),
+            se = sd(dbl) / sqrt(n()),  
+            ci_lower = mean(dbl) - qt(0.975, df = n() - 1) * se,
+            ci_upper = mean(dbl) + qt(0.975, df = n() - 1) * se) %>%
+  ungroup() -> j_dbl
+# j_dbl %>%
+#   filter(method =="htanmodel") %>%
+#   write.table("clipboard",sep="\t",row.names=F)
+
+
+jProfiles_dbl %>%
+  filter(method == "model") -> j_dbl
+
+j_dbl %>%
+  aov(dbl ~ as.factor(J), data=.) -> j_aov
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+shapiro.test(residuals(j_aov))
+
+# Homogeneity of variance - Levene's test
+car::leveneTest(pH_T_avg ~ as.factor(J),
+                jProfiles %>%
+  filter(z==0 & substrate== "eAE"))
+
+# **2. Run ANOVA**
+j_aov %>%
+  summary()
+
+# **3. Post hoc test (Tukey HSD)**
+TukeyHSD(j_aov)
+
+
+jProfiles_dbl %>%
+  # mutate(method = fct_relevel(method, 
+  #                             "99", "htandata", "htanmodel", "consecutive")) %>%
+  filter(method == "model" & substrate == "eAE") %>%
+  ggplot(aes(x= as.factor(J), y= dbl,
+             fill = as.factor(J), color = method)) +
+  #geom_boxplot() +
+  geom_violin() +
+  scale_fill_brewer(palette = "Set2") +
+  scale_color_manual(values = c("99"="black",
+                                "consecutive"="black",
+                                "htanmodel"="black",
+                                "htandata"="black")) +
+  theme_bw() +
+  labs(y = "Boundary Layer Height") +
+  scale_y_continuous(labels = function(y) y / 1000) +
+  labs(x="Current Density",
+       fill = expression("Current Density, " ~ J ~ "(" ~ A/m^2 ~ ")"),
+       color = "DBL Method, L to R") +
+  theme(legend.position = "none",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        axis.text = element_text(size=14),
+        axis.title = element_text(size=16),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))
+
+# ggsave('../figures/currentDensityBoundaryHeight.tiff',
+#        dpi = 600,
+#        width = 5,
+#        height = 5,
+#        units = "in",
+#        device = "tiff",
+#        compression = "lzw")
+```
+
+
+## pH at certain heights
+```{r}
+jProfiles %>%
+  filter(z==0 & substrate== "eAE") %>%
+  group_by(J) %>%
+  summarise(pH_avg = mean(pH_T_avg),
+            pH_sd = sd(pH_T_avg))
+
+jProfiles %>%
+  filter(z==0 & substrate== "eAE") %>%
+  aov(pH_T_avg ~ as.factor(J), data=.) -> j_aov
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+shapiro.test(residuals(j_aov))
+
+# Homogeneity of variance - Levene's test
+car::leveneTest(pH_T_avg ~ as.factor(J),
+                jProfiles %>%
+  filter(z==0 & substrate== "eAE"))
+
+# **2. Run ANOVA**
+j_aov %>%
+  summary()
+
+# **3. Post hoc test (Tukey HSD)**
+TukeyHSD(j_aov)
+
+# stats @ 5mm
+jProfiles %>%
+  filter(z == 5000 & substrate=="eAE") %>%
+  group_by(J) %>%
+  summarise(pH = mean(pH_T_avg),
+            sd = sd(pH_T_avg, na.rm =T))
+
+jProfiles %>%
+  filter(z == 5000 & substrate=="eAE") %>%
+  aov(pH_T_avg ~ as.factor(J), data=.) -> j_aov
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+shapiro.test(residuals(j_aov))
+
+# Homogeneity of variance - Levene's test
+car::leveneTest(pH_T_avg ~ as.factor(J),
+                jProfiles %>%
+                  filter(z == 5000 & substrate=="eAE"))
+
+# **2. Run ANOVA**
+j_aov %>%
+  summary()
+
+# **3. Post hoc test (Tukey HSD)**
+TukeyHSD(j_aov)
+
+# stats @ 15mm
+jProfiles %>%
+  filter(z == 15000 & substrate=="eAE") %>%
+  group_by(J) %>%
+  summarise(pH = mean(pH_T_avg),
+            sd = sd(pH_T_avg, na.rm =T))
+
+jProfiles %>%
+  filter(z == 15000 & substrate=="eAE") %>%
+  aov(pH_T_avg ~ as.factor(J), data=.) -> j_aov
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+shapiro.test(residuals(j_aov))
+
+# Homogeneity of variance - Levene's test
+car::leveneTest(pH_T_avg ~ as.factor(J),
+                jProfiles %>%
+                  filter(z == 15000 & substrate=="eAE"))
+
+# **2. Run ANOVA**
+j_aov %>%
+  summary()
+
+# **3. Post hoc test (Tukey HSD)**
+TukeyHSD(j_aov)
+
+```
+
+## stats
+```{r}
+jProfiles_dbl %>%
+  filter(method == "model") -> jDBL_htanmodel
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+jDBL_htanmodel %>%
+  group_by(J) %>%
+  summarise(shapiro_p = shapiro.test(dbl)$p.value)
+
+# Homogeneity of variance - Levene's test
+  car::leveneTest(dbl ~ as.factor(J), jDBL_htanmodel)
+
+# **2. Run ANOVA**
+aov(dbl ~ as.factor(J), jDBL_htanmodel) -> jModel
+jModel %>%
+  summary()
+
+
+# **3. Post hoc test (Tukey HSD)**
+TukeyHSD(jModel)
+```
+
+
+
+## BL Approximate to Scaling Laws?
+
+Check if the measured dbl is within the approximate scaling of each other
+
+```{r}
+data.frame(J = c(0.5, 1, 3),
+           dbl_actual = subset(j_dbl, method=="htanmodel")$mean) %>%
+          mutate(dbl_model = (J/1)^(1/3)*subset(j_dbl, method=="htanmodel")$mean[2])
+
+```
+
+
+# Flow Profiles
+
+## Plot
+```{r}
+flowProfiles %>%
+  mutate(v = as.factor(v),
+         substrate = as.factor(substrate)) -> flowProfiles
+flowProfiles %>%  
+  ggplot(aes(z, pH_T_avg, color=v)) +
+  stat_summary(
+    fun = mean, 
+    fun.min = \(x) mean(x) - sd(x), 
+    fun.max = \(x) mean(x) + sd(x),
+    geom = "pointrange") +
+  stat_summary(
+    fun = mean,
+    geom = "line"
+  ) +
+  geom_vline(xintercept = c(5000,15000), linetype="dotted") + # microfrag heights
+  geom_vline(xintercept = c(21344.005, 15049.191,  5919.626), linetype="dashed",
+             color = c("#66C2A5","#FC8D62","#8DA0CB"), linewidth=0.75) + #dbl heights calculated below
+  annotate(geom="rect",
+    xmin = c(21344.005 - 229.2434, 15049.191 - 1819.62043,  5919.626 - 1438.50908),   
+    xmax = c(21344.005 + 229.2434, 15049.191 + 1819.62043,  5919.626 + 1438.50908), 
+    ymin = -Inf,
+    ymax = Inf,
+    fill = c("#66C2A5","#FC8D62","#8DA0CB"),
+    alpha=0.3) +
+  theme_bw() +
+  labs(x = "Height (mm)",
+       y = bquote(bold(pH[T])),
+       color = expression("Bulk Flow, " ~ v ~ "("*cm~s^-1*")"),
+       shape = "Substrate") +
+  scale_color_brewer(palette = "Set2") + 
+  guides(shape = guide_legend(override.aes = list(linetype = 0))) +
+  scale_x_continuous(labels = function(x) x / 1000) +
+  theme(legend.position = "bottom",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+ggsave('../figures/bulkFlowBoundaryLayer_alt.tiff',
+       dpi = 600,
+       width = 8,
+       height = 4,
+       units = "in",
+       device = "tiff",
+       compression = "lzw")
+```
+
+## pH at certain heights
+```{r}
+flowProfiles %>%
+  filter(z==0) %>%
+  summarise(pH_avg = mean(pH_T_avg),
+            pH_sd = sd(pH_T_avg))
+```
+
+## Boundary Layer Calculations
+```{r}
+flowProfiles %>%
+  group_by(date, v,  replicate) %>%
+  nest() %>%
+  mutate(dbl = map(data, ~htanIntersecton(.x))) %>%
+  unnest(dbl) %>%
+  pivot_longer(cols = dbl_model:dbl_data,
+               names_prefix = "dbl_",
+               names_to = "method",
+               values_to = "dbl") -> flowProfiles_dbl
+
+flowProfiles_dbl %>%
+  group_by(v, method) %>%
+  summarise(mean = mean(dbl, na.rm = T),
+            sd = sd(dbl, na.rm =T),
+            n = n(),
+            se = sd(dbl) / sqrt(n()),  
+            ci_lower = mean(dbl) - qt(0.975, df = n() - 1) * se,
+            ci_upper = mean(dbl) + qt(0.975, df = n() - 1) * se) %>%
+  ungroup() -> flow_dbl
+
+# flow_dbl %>%
+#   filter(method =="htanmodel") %>%
+#   write.table("clipboard",sep="\t",row.names=F)
+
+flowProfiles_dbl %>%
+  # mutate(method = fct_relevel(method, 
+  #                             "99", "htandata", "htanmodel", "consecutive")) %>%
+  filter(method == "model") %>%
+  ggplot(aes(x= as.factor(v), y= dbl,
+             fill = as.factor(v))) +
+  #geom_boxplot() +
+  geom_violin() +
+  scale_fill_brewer(palette = "Set2") +
+  # scale_color_manual(values = c("99"="black",
+  #                               "consecutive"="black",
+  #                               "htanmodel"="black",
+  #                               "htandata"="black")) +
+  theme_bw() +
+  labs(y = "Boundary Layer Height") +
+  scale_y_continuous(labels = function(y) y / 1000) +
+  labs(x="Bulk Flow, v (cm/s)",
+       fill ="Bulk Flow, v (cm/s)",
+       color = "DBL Method, L to R") +
+theme(legend.position = "none",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+# ggsave('../figures/BulkFlowBoundaryHeight.tiff',
+#        dpi = 600,
+#        width = 5,
+#        height = 5,
+#        units = "in",
+#        device = "tiff",
+#        compression = "lzw")
+
+```
+
+```{r}
+flowProfiles_dbl %>%
+  filter(v==1) %>%
+  group_by(v) %>%
+  summarise(dbl_mean = mean(dbl),
+            dbl_sd = sd(dbl))
+
+flowProfiles_dbl %>%
+  filter(method == "model") -> flow_dbl
+
+flow_dbl %>%
+  group_by(v) %>%
+  summarise(dbl_avg = mean(dbl),
+            dbl_sd = sd(dbl)) %>%
+  mutate(across(c(dbl_avg, dbl_sd), ~.x/1000))
+
+flow_dbl %>%
+  aov(dbl ~ as.factor(v), data=.) -> flow_aov
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+shapiro.test(residuals(flow_aov))
+
+# Homogeneity of variance - Levene's test
+car::leveneTest(dbl ~ as.factor(v), flow_dbl)
+
+# **2. Run ANOVA**
+flow_aov %>%
+  summary()
+
+# **3. Post hoc test (Tukey HSD)**
+TukeyHSD(flow_aov)
+```
+
+```{r}
+# stats @ 0mm
+flowProfiles %>%
+  filter(z == 0) %>%
+  group_by(v) %>%
+  summarise(pH = mean(pH_T_avg),
+            sd = sd(pH_T_avg, na.rm =T))
+
+flowProfiles %>%
+  filter(z == 0) %>%
+  aov(pH_T_avg ~ as.factor(v), data=.) -> flow_aov
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+shapiro.test(residuals(flow_aov))
+
+# Homogeneity of variance - Levene's test
+car::leveneTest(pH_T_avg ~ as.factor(v), flowProfiles %>%
+  filter(z == 5000))
+
+# **2. Run ANOVA**
+flow_aov %>%
+  summary()
+
+# **3. Post hoc test (Tukey HSD)**
+TukeyHSD(flow_aov)
+# stats @ 5mm
+flowProfiles %>%
+  filter(z == 5000) %>%
+  group_by(v) %>%
+  summarise(pH = mean(pH_T_avg),
+            sd = sd(pH_T_avg, na.rm =T))
+
+flowProfiles %>%
+  filter(z == 5000) %>%
+  aov(pH_T_avg ~ as.factor(v), data=.) -> flow_aov
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+shapiro.test(residuals(flow_aov))
+
+# Homogeneity of variance - Levene's test
+car::leveneTest(pH_T_avg ~ as.factor(v), flowProfiles %>%
+  filter(z == 5000))
+
+# **2. Run ANOVA**
+flow_aov %>%
+  summary()
+
+# **3. Post hoc test (Tukey HSD)**
+TukeyHSD(flow_aov)
+
+# stats @ 15mm
+flowProfiles %>%
+  filter(z == 15000) %>%
+  group_by(v) %>%
+  summarise(pH = mean(pH_T_avg),
+            sd = sd(pH_T_avg, na.rm =T))
+
+flowProfiles %>%
+  filter(z == 15000) %>%
+  aov(pH_T_avg ~ as.factor(v), data=.) -> flow_aov
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+shapiro.test(residuals(flow_aov))
+
+# Homogeneity of variance - Levene's test
+car::leveneTest(pH_T_avg ~ as.factor(v), flowProfiles %>%
+  filter(z == 15000))
+
+# **2. Run ANOVA**
+flow_aov %>%
+  summary()
+
+# **3. Post hoc test (Tukey HSD)**
+TukeyHSD(flow_aov)
+
+```
+
+
+## What is the pH @ heights of coral?
+
+```{r}
+flowProfiles %>%
+  filter(z == 5000 | z== 15000) %>%
+  bind_rows(
+    jProfiles %>%
+      filter(z == 5000 | z== 15000) %>%
+      filter(substrate=="eAE") %>%
+      mutate(v=1)
+  ) %>%
+  group_by(v, z, J) %>%
+  summarise(pH = mean(pH_T_avg),
+            sd = sd(pH_T_avg, na.rm =T),
+            n = n(),
+            se = sd(pH_T_avg) / sqrt(n()),  
+            ci_lower = mean(pH_T_avg) - qt(0.975, df = n() - 1) * se,
+            ci_upper = mean(pH_T_avg) + qt(0.975, df = n() - 1) * se) %>%
+  mutate(across(c(pH, sd, se, ci_lower, ci_upper), ~signif(.x,4)),
+         z = z/1000) %>%
+  arrange(v, J)#%>%
+  #write.table("clipboard",sep="\t",row.names=F)
+  
+```
+
+## Model Omega @ heights of coral
+```{r}
+## avg measured values across experiments
+dic_init <- 2108e-6
+ta_init <- 2436e-6
+S <- 34
+Temp <- 27
+pHFinal = flowProfiles %>%
+  filter((z == 5000 | z== 15000) & v == 1 ) %>%
+  group_by(z) %>%
+  summarise(pH = mean(pH_T_avg)) %>%
+  pull(pH)
+
+# pHFinal<-8.16
+
+# Function to calculate carb system after adding carbonate
+carbAddition <- function(dic_init, ta_init, species, mineral_addition, S, T) {
+  if(species == "co3") {
+    dic_new <- dic_init + mineral_addition
+    ta_new <- ta_init + 2*mineral_addition
+  } else if(species == "hco3") {
+    dic_new <- dic_init + mineral_addition
+    ta_new <- ta_init + mineral_addition
+  } else if(species == "oh") {
+    dic_new <- dic_init
+    ta_new <- ta_init + mineral_addition
+  } else{
+    return(NA)
+  }
+  # Use carb function to calculate pH from DIC and TA
+  # Flag 15 means we're providing ALK and DIC as inputs
+  result <- carb(flag = 15, var1 = ta_new, var2 = dic_new, 
+                 S = S, T = Temp)
+  
+  return(result)
+}
+
+# Find what co3 added would get us to pH
+CO3_try <- seq(0, 500e-6, length.out = 10000)
+carbs <- carbAddition(dic_init = dic_init,
+                    ta_init = ta_init,
+                    species = "co3",
+                    mineral_addition = CO3_try,
+                    S = S,
+                    T = T) %>%
+  bind_cols(data.frame(CO3_addition = CO3_try))
+
+# Find the value of co3 that minimizes the difference
+carbs %>%
+  filter(pH == carbs$pH[which.min(abs(pHFinal - carbs$pH))]) %>%
+  select(pH:OmegaAragonite, CO3_addition) -> carbs_5mm
+
+# Print the amount of carbonate added
+cat("Amount of CO3²⁻ added:", carbs_5mm$CO3_addition*1e6, "μmol/kg\n")
+
+# Calculate the final parameters
+dic_co3 <- dic_init + carbs_5mm$CO3_addition[1]
+ta_co3 <- ta_init + 2*carbs_5mm$CO3_addition[1]
+
+
+# Find what oh added would get us to pH
+oh_try <- seq(0, 500e-6, length.out = 10000)
+carbs <- carbAddition(dic_init = dic_init,
+                    ta_init = ta_init,
+                    species = "oh",
+                    mineral_addition = oh_try,
+                    S = S,
+                    T = T) %>%
+  bind_cols(data.frame(oh_addition = oh_try))
+
+# Find the value of co3 that minimizes the difference
+carbs %>%
+  filter(pH == carbs$pH[which.min(abs(pHFinal - carbs$pH))]) %>%
+  select(pH:OmegaAragonite, oh_addition) -> carbs_5mm
+
+# Print the amount of carbonate added
+cat("Amount of OH⁻ added:", carbs_5mm$CO3_addition*1e6, "μmol/kg\n")
+
+# Calculate the final parameters
+dic_oh <- dic_init
+ta_oh <- ta_init + carbs_5mm$oh_addition[1]
+
+
+
+# Find the value of co3 that minimizes the difference
+# carbs %>%
+#   filter(pH == carbs$pH[which.min(abs(pHFinal[2] - carbs$pH))]) %>%
+#   select(pH:OmegaAragonite, CO3_addition) -> carbs_15mm
+# 
+# # Print the amount of carbonate added
+# cat("Amount of CO3²⁻ added:",carbs_15mm$CO3_addition*1e6, "μmol/kg\n")
+# 
+# # Calculate the final parameters
+# dic_final <- dic_init + carbs_15mm$CO3_addition[1]
+# ta_final <- ta_init + 2*carbs_15mm$CO3_addition[1]
+
+```
+
+Chan & Connolly (2013) meta analysis suggests that there is an approximately ~15% change in calcification rates per unit change in omega. This range is only valid over omega 2-4.
+
+```{r}
+omega_init = carb(flag = 15,
+                  var1 = ta_init,
+                  var2 = dic_init, 
+                  S = S, T = T)
+
+omega_co3 = carb(flag = 15,
+                  var1 = ta_co3,
+                  var2 = dic_co3, 
+                  S = S, T = T)
+
+omega_oh = carb(flag = 15,
+                  var1 = ta_oh,
+                  var2 = dic_oh, 
+                  S = S, T = T)
+
+cat("Initial omega calculated:", omega_init, "\n")
+cat("Final omega calculated assuming CO3:", omega_co3, "\n")
+cat("Final omega calculated assuming OH:", omega_oh, "\n")
+cat("Difference omega calculated:", c((omega_co3 - omega_init),(omega_oh - omega_init)), "\n")
+cat("Predicted delta G based on omega difference:", (omega_oh$OmegaAragonite - omega_init$OmegaAragonite)*0.15, "\n")
+
+
+
+# langdon 2000 calcs
+k = c(1.2e7, 0.9e7,1.5e7) # lower = 0.9, upper = 1.5
+n = c(0.69, 0.65, 0.73) # lower
+C = c(-89, -93, -85)
+Ca = 10.12e-3
+
+G_init = k*(Ca^n)*omega_init$CO3+C
+G_oh = k*(Ca^n)*omega_oh$CO3+C
+
+(G_oh - G_init) / G_init * 100 # 92% predicted increase mean
+```
+This underestimation is to be expected due to the nonlinear effect of omega on G (Anthony et al. 2011), and the per unit reduction range is wide (0-31% per unit of omega decreae, 95% CI), granting an upper predicted G increase of 37%. Our G increaes (~48%) are in line with studies that tested a larger range of aragonites including Langdon et al. (2000), Ohde & Hussain (2004)
+
+# Property-Property Plots
+
+```{r}
+library(metR)
+library(geomtextpath)
+
+# Define range for DIC and TA
+DIC_range <- seq(2050, 2300, by = 5) # umol/kg
+TA_range <- seq(2350, 2650, by = 5)  # umol/kg
+
+# Generate grid of DIC and TA
+dat <- expand.grid(DIC = DIC_range, TA = TA_range) %>%
+# Calculate carbonate chemistry using seacarb (flag=15 means DIC & TA given)
+# Assume salinity = 35, temperature = 25°C, pressure = 0 dbar
+  mutate(carb(
+  flag = 15,
+  var1 = TA/10^6,
+  var2 = DIC/10^6,
+  S = 34, T = 27, P = 0, Patm = 1, Pt = 0, Sit = 0
+)) %>%
+  select(DIC, TA, pH, pCO2, OmegaAragonite) %>%
+  mutate(DIC = DIC*10^6,
+         alpha = case_when(abs(pH - 8.16) <= 0.02 ~ 1.0,
+                           TRUE ~ 0.5))
+
+carb_points <- data.frame(name = c('experimental', 'co3 addition', 'oh addition'),
+           DIC = c(2108, 2201.959, 2108),
+           TA = c(2436, 2623.919, 2517.108))
+
+# Plot using ggplot
+ggplot(dat, aes(x = DIC, y = TA, fill = pH, z=pH)) +
+  geom_raster(interpolate = TRUE) +
+  scale_fill_gradientn(colours = paletteer::paletteer_c("grDevices::rainbow", 7)) + # 
+  geom_contour(color = "black", alpha = 0.7, linewidth = 0.6,
+               binwidth =  0.1) +
+  geom_textcontour(binwidth = 0.1, size = 3, spacing=0.5, gap=TRUE,
+                   vjust=0, hjust=0.4) +
+  geom_contour_filled(aes(z = pH),
+                        breaks = c(8.14, 8.18),
+                        show.legend = FALSE,
+                        alpha = 0.0,
+                        linetype = "dashed",
+                        color = "black",
+                        fill = NA,
+                        linewidth = 1) +
+  # geom_contour(aes(x=DIC, y=TA, z=OmegaAragonite),
+  #              data = subset(dat, pH>=8.14 & pH<=8.18),
+  #             color = "black", alpha = 0.7, linewidth = 0.5,
+  #              binwidth = 0.2,
+  #              inherit.aes = F) +
+  # geom_textcontour(aes(x=DIC, y=TA, z=OmegaAragonite),
+  #              data = subset(dat, pH>=8.14 & pH<=8.18),
+  #              binwidth = 0.2,
+  #              size = 3, gap=FALSE,
+  #              spacing = 100,
+  #              vjust=0) +
+  geom_point(data = carb_points, aes(DIC, TA),
+             color="darkred", size=3, inherit.aes = F) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = expression("Dissolved Inorganic Carbon ("*mu*"mol kg"^{-1}*")"),
+       y = expression("Total Alkalinity ("*mu*"mol kg"^{-1}*")"),
+       fill = "pH") +
+  annotate("segment",
+           x = 2115, y = 2445,
+           xend = 2198, yend = 2609,
+           arrow = arrow(length = unit(0.2, "cm")),
+           color = "darkred", linewidth = 2) +
+  # annotate("text", label = expression("CO"[3]^{"2-"}),
+  #    x = 2150, y = 2540, fontface="bold",
+  #    color = "darkred", size = 5, angle=45) +
+  annotate("segment",
+         x = 2108, y = 2444,
+         xend = 2108, yend = 2506,
+         arrow = arrow(length = unit(0.2, "cm")),
+         color = "darkred", linewidth = 2) +
+  # annotate("text", label = bquote("OH"^"-"),
+  #      x = 2100, y = 2471, fontface="bold",
+  #      color = "darkred", size = 5, angle=90) +
+  theme_minimal()
+
+ggsave('../figures/property-propertyPlot.tiff',
+       dpi = 600,
+       width = 6,
+       height = 5,
+       units = "in",
+       device = "tiff",
+       compression = "lzw")
+```
+

@@ -1,0 +1,403 @@
+---
+title: "eAE Growth Analysis"
+author: "Patrick Kiel"
+date: "2023-12-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F)
+
+# load libraries
+library(tidyverse)
+library(seacarb)
+library(lme4)
+library(emmeans)
+library(lsmeans)
+library(lmerTest)
+library(rstatix)
+library(wesanderson)
+library(ggpubr)
+library(grid)
+```
+
+```{r, load data}
+assignment <- read_csv("../data/acerExperiment/tankAssignment.csv") %>%
+    mutate(tag = as.character(tag),
+           tank = as.factor(tank))
+
+bw <- read_csv("../data/acerExperiment/bwData.csv") %>%
+        # sw calculate density from YSI vlaues
+  mutate(rho = rho(S= sal, T = temp)/1000, .after="mass",
+         # calculate mass in air from sw density, aragonite density, bw
+          mass_a = mass/(1-rho/2.93),
+         # convert date to date object
+         date = as.Date(date, format="%m/%d/%Y"))
+
+sa <- read_csv('../data/acerExperiment/surfaceAreas.csv') %>%
+  mutate(tag = as.character(tag))
+
+growth <- bw %>%
+  left_join(assignment, by="tag") %>%
+  left_join(sa, by = "tag") %>%
+  arrange(tag,date) %>%
+  group_by(tag) %>%
+  # calculate mass gain in mg
+  mutate(dailyMassGain = (mass_a - lag(mass_a))*1000/as.numeric(date-lag(date)),
+         G = dailyMassGain/SA.cm2,
+         days = as.numeric(date - first(date)),
+         .after = "mass_a") %>%
+  drop_na(tank, dailyMassGain)
+```
+
+```{r lmExtractFunction, include=F}
+# function to extract linear model parameters
+
+lmExtractCI <- function(mod) {
+  combinedCoefs = c(coef(mod), confint(mod, level=0.95))
+  names(combinedCoefs) = c("mean", "lowerCI", "upperCI")
+  return(combinedCoefs)
+}
+
+```
+
+# Controls
+
+## How did control acrylic corals grow?
+
+```{r acrylic-growth}
+growth %>%
+  filter(substrate=="inert") %>%
+  ggplot(aes(x=date, y=dailyMassGain,
+             group=interaction(as.factor(date),tank),
+             fill = tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Mass gain (mg/day)",
+         title = "Acrylic Controls Daily Mass Gain")
+
+growth %>%
+  filter(substrate=="inert") %>%
+  ggplot(aes(x=tank, y=dailyMassGain,
+             fill = tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Mass gain (mg/day)",
+         title = "Acrylic Controls Daily Mass Gain")
+
+growth %>%
+  filter(substrate=="inert") %>%
+  ggplot(aes(x=tank, y=G,
+             fill = tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Growth Rate (mg/day/cm2)",
+         title = "Acrylic Controls Standardized Daily Growth Rate")
+
+growth %>%
+  filter(substrate=="inert") %>%
+  group_by(substrate) %>%
+  summarise(G_mean = mean(dailyMassGain, na.rm=T),
+            G_std = sd(dailyMassGain, na.rm=T))
+
+growth %>%
+  filter(substrate=="inert") %>%
+  group_by(substrate) %>%
+  summarise(G_mean = mean(G, na.rm=T),
+            G_std = sd(G, na.rm=T))
+
+# no differences among tank
+growth %>%
+  filter(substrate=="inert") %>%
+  lmer(dailyMassGain ~ tank + (1|tag), data=.) -> mod
+anova(mod)
+marginal = emmeans(mod, ~ tank)
+pairs(marginal, adjust="tukey") %>%
+  broom::tidy()
+
+# no differences among genet
+growth %>%
+  filter(substrate=="inert") %>%
+  lmer(dailyMassGain ~ genotype + (1|tag), data=.) -> mod
+anova(mod)
+marginal = emmeans(mod, ~ genotype)
+pairs(marginal, adjust="tukey") %>%
+  broom::tidy()
+```
+
+## How did the control eAE plugs abiotically grow?
+```{r control-growth}
+growth %>%
+  filter(genotype=="control") %>%
+  ggplot(aes(x=date, y=dailyMassGain,
+             group=interaction(as.factor(date),tank),
+             fill = tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Mass gain (mg/day)",
+         title = "All eAE Controls by Date")
+
+# sometimes messy data if the glue fell off which was accounted for, remove those
+growth %>%
+  filter(genotype=="control" & (str_detect(notes, "glue", negate=T) | is.na(notes))) %>%
+  ggplot(aes(x=date, y=dailyMassGain,
+             group=interaction(as.factor(date),tank),
+             fill = tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Mass gain (mg/day)",
+         title = "Filtered eAE Controls by Date")
+
+growth %>%
+  filter(genotype=="control" & (str_detect(notes, "glue", negate=T) | is.na(notes))) %>%
+  ggplot(aes(x=tank, y=dailyMassGain,fill = tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Mass gain (mg/day)",
+         title = "Filtered eAE Controls by Tank")
+
+growth %>%
+  filter(genotype=="control" & (str_detect(notes, "glue", negate=T) | is.na(notes))) %>%
+  group_by(genotype) %>%
+ summarise(G_mean = mean(dailyMassGain, na.rm=T),
+          G_std = sd(dailyMassGain, na.rm=T))
+
+# no differences in abiotic growth per tank
+growth %>%
+  filter(genotype=="control" & (str_detect(notes, "glue", negate=T) | is.na(notes))) %>%
+  lmer(dailyMassGain ~ tank + (1|tag), data=.) -> mod
+shapiro.test(residuals(mod))
+anova(mod)
+marginal = emmeans(mod, ~ tank)
+pairs(marginal, adjust="tukey") %>%
+  broom::tidy()
+
+# no differences in abiotic growth through time
+growth %>%
+  filter(genotype=="control" & (str_detect(notes, "glue", negate=T) | is.na(notes))) %>%
+  lmer(dailyMassGain ~ days + (1|tag), data=.) -> mod
+anova(mod)
+
+growth %>%
+  filter(genotype=="control") %>%
+  filter(G > 0) %>%
+  mutate(experiment = "acer") %>%
+  write_csv(., '../data/microfragExperiment/abioticG_compare_acerExpData.csv')
+```
+
+
+# eAE Corals
+
+We will first look at the total eAE growth and then subtract out this average eAE growth per tank for the corals to see how they perform against the combination of the bare cathode and acrylic controls. This is the basis of our investigation: do corals grown with eAE grow faster than controls after accounting for the abiotic precipitate.
+
+## How did the eAE corals grow?
+
+```{r eAE-corals}
+growth %>%
+  filter(substrate=="eAE" & genotype!="control") %>%
+  ggplot(aes(date, dailyMassGain, group=interaction(as.factor(date),tank),
+             fill=tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Mass gain (mg/day)",
+       title = "All eAE Corals by Tank and Date")
+
+growth %>%
+    filter(substrate=="eAE" & genotype!="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+  ggplot(aes(date, dailyMassGain, group=interaction(as.factor(date),tank),
+             fill=tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Mass gain (mg/day)",
+       title = "Filtered eAE Corals by Tank and Date")
+
+growth %>%
+    filter(substrate=="eAE" & genotype!="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+  ggplot(aes(tank, dailyMassGain,
+             fill=tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Mass gain (mg/day)",
+       title = "Filtered eAE Corals by Tank")
+
+growth %>%
+    filter(substrate=="eAE" & genotype!="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+  ggplot(aes(tank, massG,
+             fill=tank)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(y = "Daily Growth Rates (mg/day/gram)",
+       title = "eAE Corals' Standardized Daily Growth Rates by Tank")
+
+growth %>%
+   filter(substrate=="eAE" & genotype!="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+  group_by(substrate) %>%
+  summarise(G_mean = mean(dailyMassGain, na.rm=T),
+            G_sd = sd(dailyMassGain, na.rm=T))
+
+# no diffeences in eAE by tank
+growth %>%
+    filter(substrate=="eAE" & genotype!="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+  aov(dailyMassGain ~ tank, data=.) %>%
+  TukeyHSD() %>%
+  broom::tidy()
+
+# no differences in eAE by genet
+growth %>%
+    filter(substrate=="eAE" & genotype!="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+  aov(dailyMassGain ~ genotype, data=.) %>%
+  TukeyHSD() %>%
+  broom::tidy()
+```
+
+## Subtracting eAE controls from the eAE Corals
+
+We can combine the means and confidence intervals for all the corals thus far to get a rough comparison to the eAE corals. I'm labeling this row "combined controls" below.
+
+```{r}
+# growth rates after substracting out mean abiotic growth
+growth %>%
+   filter(substrate=="eAE" & genotype!="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+  mutate(dailyMassGain = dailyMassGain - 34.04715) %>%
+  group_by(substrate) %>%
+  summarise(G_mean = mean(dailyMassGain, na.rm=T),
+            G_sd = sd(dailyMassGain, na.rm=T))
+
+growth %>%
+   filter(substrate=="eAE" & genotype!="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+  mutate(G = (dailyMassGain - 34.04715)/SA.cm2) %>%
+  group_by(substrate) %>%
+  summarise(G_mean = mean(G, na.rm=T),
+            G_sd = sd(G, na.rm=T))
+
+## monte carlo error propagation methods ----
+# monte carlo error propagation for the daily mass gain
+set.seed(123)
+
+# means & SD
+bare_mean = 34.05
+bare_sd = 6.69
+combined_mean = 41.45
+combined_sd = 3.96
+  
+# Number of simulations
+n_sim <- 10000
+
+# Generate random samples from each distribution
+combinedMC <- rnorm(n_sim, mean = combined_mean, sd = combined_sd)
+bareMC <- rnorm(n_sim, mean = bare_mean, sd = bare_sd)
+
+# Subtract to get corrected coral growth
+correctedMC <- combinedMC - bareMC
+
+# Get summary stats
+mean_corrected <- mean(correctedMC)
+sd_corrected <- sd(correctedMC)
+
+# Print results
+cat("Corrected coral growth:", round(mean_corrected, 2), "±", round(sd_corrected, 2), "mg d^-1")
+#-------
+
+
+# create my new dataframe
+growth_final <- growth %>%
+   filter(substrate=="eAE" & genotype!="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+  mutate(substrate = "eAE Coral")
+  
+growth_final %>%
+  bind_rows(growth_final %>%
+  mutate(substrate = "eAE Coral Adjusted",
+         dailyMassGain = dailyMassGain - 34.04715)) %>%
+bind_rows(growth %>%
+   filter(substrate=="inert") %>%
+     mutate(substrate="Inert")) %>%
+  bind_rows(
+  growth %>%
+  filter(substrate=="eAE" & genotype=="control" & ((str_detect(notes, "glue", negate=T) & str_detect(notes, "electric", negate=T)) | is.na(notes))) %>%
+    mutate(substrate = "eAE Bare")) -> growth_final
+  
+# skip the blue for Moonrise3 palette
+moonrise_colors <- c(wes_palette("Moonrise3")[3:5], wes_palette("Moonrise3")[2])
+moonrise_colors_g <- c(wes_palette("Moonrise3")[5], wes_palette("Moonrise3")[2])
+
+
+# Set factor levels
+growth_final$substrate <- factor(growth_final$substrate,
+                                 levels = c("eAE Coral", "eAE Bare",
+                                            "eAE Coral Adjusted", "Inert"))
+# adjust the G for the eAE Coral Adjusted Group
+growth_final %>%
+  filter(substrate == "Inert" | substrate == "eAE Coral Adjusted") %>%
+  mutate(G = dailyMassGain/SA.cm2) -> growth_final_g
+
+
+panel_a <- growth_final %>%
+  ggplot(aes(substrate,dailyMassGain,fill=substrate)) +
+  geom_boxplot(notch = F) +
+  scale_fill_manual(values = moonrise_colors) +
+  labs(x = "Substrate",
+       #y = expression("Daily Growth Rate (mg "~day^-1*")"),
+       y = bquote(bold("Daily Growth Rate (mg "~day^-1*")"))) +
+  theme_bw() +
+ theme(legend.position = "none",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+panel_b <- growth_final_g %>%
+  ggplot(aes(substrate,G,fill=substrate)) +
+  geom_boxplot(notch = F) +
+  scale_fill_manual(values = moonrise_colors_g) +
+  labs(x = "Substrate",
+       y = bquote(bold("Daily Calcification Rate (mg "~cm^-2~day^-1*")"))) +
+  theme_bw() +
+ theme(legend.position = "none",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+# combine the plots
+ggarrange(panel_a + rremove("xlab"), panel_b + rremove("xlab"), 
+          labels = c("A", "B"),
+          ncol = 2, nrow = 1,
+          widths = c(3,2)) -> figure
+annotate_figure(figure,
+                bottom = text_grob("Substrate", face = "bold", size = 12))
+
+ggsave('../figures/acerGrowthPlot.tiff',
+       width = 9, height=5, dpi=600,
+       units = "in",
+       device = "tiff", compression ="lzw")
+
+#stats
+ggplot(growth_final_g, aes(sample = (dailyMassGain))) +
+  stat_qq() + 
+  stat_qq_line() +
+  theme_minimal() +
+  labs(title = "QQ Plots for Daily Growth Rate", x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+var.test(G~substrate, data = growth_final_g) # p > 0.05 can assume equal variance
+
+# proceed with lmer to account for repeated measures
+mod <- lmer(G ~ substrate + (1 | tank) + (1 | tag),
+              data = growth_final_g)
+summary(mod)
+anova(mod)
+
+```

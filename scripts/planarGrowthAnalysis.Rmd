@@ -1,0 +1,262 @@
+---
+title: "Planar Growth Analysis"
+output: html_notebook
+---
+
+## Load packages
+```{r load-packages}
+library(tidyverse)
+library(wesanderson)
+library(lme4)
+library(emmeans)
+library(lsmeans)
+library(lmerTest)
+library(rstatix)
+```
+
+## Import Data
+```{r import-data}
+areas <- read_csv('../data/microfragExperiment/planarAreas.csv')
+photoIDs <- read_csv('../data/microfragExperiment/photoIDs.csv')
+tankAssignment <- read_csv('../data/microfragExperiment/tankAssignment.csv')
+```
+
+
+## Merge Data
+```{r}
+planarPhotoIds <- unique(areas$photoID)
+vector_df <- tibble(photoID = planarPhotoIds)
+
+photoIDs %>%
+  pivot_longer(pos1:pos5,
+               names_pattern = "pos(.*)",
+               names_to = "position",
+               values_to = "id",
+               values_drop_na = T) %>%
+  mutate(id_lower = as.integer(str_sub(photoIDs, 1,3)),
+         id_upper = as.integer(str_sub(photoIDs, -3)),
+         date = parse_date(date, format="%m/%d/%Y"),
+         position = as.integer(position)) %>%
+  select(-photoIDs) %>%
+  rowwise() %>%
+  mutate(photoID = list(vector_df$photoID[vector_df$photoID >= id_lower & vector_df$photoID <= id_upper])) %>%
+  unnest(photoID) %>%
+  select(-c(id_lower,id_upper)) -> photoIDs
+
+# cast correct column types
+areas <- areas %>%
+  mutate(date = parse_date(date, format="%m/%d/%Y"))
+
+photoIDs %>%
+  left_join(areas,
+            by = c("date",
+                   "position",
+                   "photoID")) -> planarAreas
+
+planarAreas %>%
+  left_join(tankAssignment, by ="id") %>%
+  select(date, photoID, position, id, area, x, y, substrate:tank) -> planarAreas
+
+rm(planarPhotoIds, vector_df)
+```
+
+
+## total percent growth data
+```{r}
+planarAreas %>%
+  filter(height != "blank") %>%
+  arrange(id, date) %>%
+  group_by(id, substrate, genotype, height, tank) %>%
+  summarise(per_growth = (last(area)-first(area))/first(area)) -> perGrowthRates
+```
+
+```{r}
+perGrowthRates %>%
+  group_by(substrate, height) %>%
+  summarise(growthRate = mean(per_growth),
+            growthrate_sd = sd(per_growth)) %>%
+  ungroup()
+```
+
+
+
+## Emtrends slope technique to account for high variability
+
+Splitting by short/tall for morphological differences as short corals can reach the substrate and begin skirting. Additionally  Then looking for differences in slope between the corals.
+
+```{r}
+moonrise_subset <- c(rep(c(wes_palette("Moonrise3")[5], wes_palette("Moonrise3")[2]),2))
+
+planarAreas %>%
+  filter(height!="blank") %>%
+  mutate(sh = paste(substrate, height, sep="-"),
+         height = str_to_title(height),
+         substrate = case_when(substrate == "inert" ~ "Inert", T ~ substrate)) %>%
+  ggplot(aes(date, area, shape = substrate,
+             group=as.factor(sh))) +
+  geom_point(size=3) +
+  geom_smooth(method="lm", aes(group=substrate,
+                               linetype = substrate),
+              color="black",
+              show.legend = F) +
+  # duplicate to hack the legend
+  geom_smooth(method="lm", aes(group=substrate,
+                             linetype = substrate),
+            color="black", se = F,
+            show.legend = T) +
+  scale_linetype_manual(values = c("eAE"=1,"Inert"=3)) +
+  #scale_color_manual(values = moonrise_subset) +
+  scale_x_date(limits = c(as.Date("2024-02-15"), as.Date("2024-05-01"))) +
+  facet_wrap(~height) +
+  labs(shape = "Substrate", linetype = "Substrate",
+       x = "Date", y= bquote(bold('Area '~(cm^2)))) +
+  # geom_text(data = data.frame(x = as.Date("2024-03-01"), area = Inf,
+  #                             #labs = c("Short", "Tall"),
+  #                             height = c("Short", "Tall")),
+  #        aes(x = x, y=area, label = height), inherit.aes = F,
+  #        hjust = 0, vjust = 1.6,
+  #        nudge_x = -15,
+  #        size = 5, fontface = "bold") +
+  #guides(linetype = )
+  theme_bw() +
+  theme(#legend.position = "bottom",
+        #strip.background = element_blank(),
+        legend.position=c(0.14, 0.87),
+        legend.direction = "horizontal",
+        legend.title.position = "top",
+        legend.title = element_text(size=10, face="bold"),
+        legend.box.background = element_rect(color="black", linewidth = 0.5),
+        strip.text.x = element_text(size = 14, face="bold"),
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=12),
+        axis.title = element_text(size=14, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+ggsave('../figures/planarGrowth_CI.svg',
+       dpi = 600,
+       width = 10,
+       height = 5,
+       units = "in",
+       device = "svg")
+       #compression = "lzw")
+
+
+planarAreas %>%
+  filter(height!="blank") %>%
+  group_by(substrate,height) %>%
+  nest() %>%
+  mutate(slope = map(data, function(df) {
+                        mod = lm(area ~ date, data=df)
+                        return(coefficients(mod)[2])
+                        })) %>%
+  unnest(slope) %>%
+  arrange(substrate) %>%
+  group_by(height) %>%
+  mutate(ratio = slope/lag(slope))
+
+```
+
+## stats
+```{r}
+planarAreas %>%
+  arrange(id, date) %>%
+  group_by(id) %>%
+  mutate(days = as.numeric(date - first(date))) %>%
+  ungroup() -> planarAreas
+
+model <- lmer(area ~ days * substrate * height + (1|tank) + (1 | id), data=planarAreas)
+
+# check model assumptions
+ggplot(planarAreas, aes(sample = (area))) +
+  stat_qq() + 
+  stat_qq_line() +
+  theme_minimal() +
+  labs(title = "QQ Plots for Planar Areas", x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+shapiro.test(residuals(model)) # residuals are normal, agrees w/ QQQ
+boxplot(residuals(model) ~ planarAreas$height) # homoscedascity 
+
+# Model summary
+summary(model)
+
+# Estimated marginal means slopes for pairwise comparisons
+growth_rates <- emtrends(model, ~ substrate * height, var = "days")
+
+# Pairwise comparisons of slopes
+pairwise_comparisons <- pairs(growth_rates, adjust="tukey")
+
+# Display results
+growth_rates %>%
+  broom::tidy() %>%
+  mutate(SD = std.error * sqrt(df),
+         .after= "days.trend")
+pairwise_comparisons
+
+percent_diff_ci <- function(slope1, se1, slope2, se2, df, conf=0.95) {
+  diff <- slope1 - slope2
+  percent_diff <- (diff / slope2) * 100
+  
+  # Standard error of percent difference
+  se_diff <- sqrt(se1^2 + se2^2)
+  se_percent <- (se_diff / abs(slope2)) * 100
+  
+  # t-value for the given confidence level
+  t_val <- qt(1 - (1 - conf)/2, df)
+  
+  # Confidence interval
+  lower <- percent_diff - t_val * se_percent
+  upper <- percent_diff + t_val * se_percent
+  
+  c(percent_diff = percent_diff, lower_CI = lower, upper_CI = upper)
+}
+
+broom::tidy(growth_rates) -> growth_rates
+bind_cols(
+comparison = c("eAE short vs inert short",
+               "eAE short vs eAE tall",
+               "eAE short vs inert tall"),
+
+#eAE short vs inert short
+bind_rows(
+percent_diff_ci(growth_rates$days.trend[2],growth_rates$std.error[2],
+                growth_rates$days.trend[1],growth_rates$std.error[1],
+                df=137),
+
+#eAE short vs eAE tall
+percent_diff_ci(growth_rates$days.trend[2],growth_rates$std.error[2],
+                growth_rates$days.trend[4],growth_rates$std.error[4],
+                df=137),
+
+# eAE short vs inert tall
+percent_diff_ci(growth_rates$days.trend[2],growth_rates$std.error[2],
+                growth_rates$days.trend[3],growth_rates$std.error[3],
+                df=137)
+))
+```
+
+Any differences among genotypes?
+
+Can I remove from the random effects?
+
+
+## Assess Errors
+
+Checking errors by looking at the consistency of substrate area
+
+```{r}
+areaErrors <- readxl::read_excel('../data/microfragExperiment/photoScaleCheck.xlsx')
+
+areaErrors %>%
+  group_by(substrate) %>%
+  summarise(mean = mean(diameter, na.rm = T),
+          sd = sd(diameter, na.rm=T)) %>%
+  mutate(RSD = 100*sd/mean) -> areaErrors
+```
+The average acrylic substrate was measured to be `r round(areaErrors$mean[1],3)` $\pm$ `r round(areaErrors$sd[1],3)` $cm^2$, granting a relative standard deviation (RSD) of `r round(areaErrors$RSD[1],3)`%. The average steel substrate was measured to be `r round(areaErrors$mean[2],3)` $\pm$ `r round(areaErrors$sd[2],3)` $cm^2$, granting a relative standard deviation (RSD) of `r round(areaErrors$RSD[2],3)`%. These random errors represent less than `r round(max(areaErrors$RSD))`% of the target measurements throughout the monitoring period. Therefore, the scaled photographic measuring technique was deemed acceptable for this analysis. 

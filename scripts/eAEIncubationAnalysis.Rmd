@@ -1,0 +1,330 @@
+---
+title: "eAE Incubation Analysis"
+output: html_notebook
+---
+
+```{r, load-packages}
+#load libraries
+library(tidyverse)
+library(readxl)
+library(hms)
+library(respR)
+library(seacarb)
+library(wesanderson)
+```
+
+```{r, load-data}
+dat <- read_excel('../data/eAECarbChemIncubations/incubationMetadata.xlsx',
+                  guess_max = 100, na="") %>%
+  mutate(across(c(time_start, time_stop), ~as_hms(.x)),
+         hours = as.numeric(time_stop-time_start)/3600, # calculate time in hours
+         T_avg = rowMeans(select(., starts_with("T_")), na.rm = TRUE), #average start/end temp
+         O2_start = convert_DO(O2_start, from = "%Air",
+                               to = "umol/L", S=33, t = T_start)/1.023, #%Air to uM/L to uM/kg
+         O2_stop = convert_DO(O2_stop, from = "%Air",
+                              to = "umol/L", S=33, t = T_stop)/1.023,
+         O2_diff = (O2_stop-O2_start)) %>%
+  select(-c(ccBID_start,ccBID_stop))
+
+# add nutrient data ----
+#load nutrient data
+nutrients <- read_csv("../data/eAECarbChemIncubations/incubationNutrients.csv") %>%
+  select(sample_id, uM, nutrient) %>%
+  filter(nutrient != "Si") %>% # Si data not needed for TA anomaly
+  # extract id# from sample_id for joining
+  mutate(sample_id = as.numeric(str_extract(sample_id, "[[:digit:]]+")),
+         #convert uM/L to uM/kg
+         uM = uM/1.023) %>%
+  # cast wide
+  pivot_wider(names_from = "nutrient",
+              values_from = "uM") %>%
+  # combine no3 and no2
+  mutate(`NO3+NO2` = NO3 + NO2) %>%
+  select(-c(NO3, NO2))
+
+# extract initials
+nutrients_start <- nutrients %>%
+  filter(sample_id %in% dat$nutBID_start) %>%
+  rename_with(.cols = NH4:`NO3+NO2`,
+              ~paste(., "start", sep = "_"))
+
+  # sample 1 values out of range, replacing with the median of all initials
+nutrients_start <-  nutrients_start %>%
+    filter(sample_id!=1) %>%
+    bind_rows(nutrients_start %>%
+                select(-sample_id) %>%
+                summarise(across(everything(), median)) %>%
+                mutate(sample_id=1, .before = "NH4_start"))
+
+# extract post incubations
+nutrients_stop <- nutrients %>%
+  filter(sample_id %in% dat$nutBID_stop) %>%
+  rename_with(.cols = NH4:`NO3+NO2`,
+              ~paste(., "stop", sep = "_"))
+
+# add to incubation master
+dat <- dat %>%
+  left_join(nutrients_start,
+            by=c("nutBID_start"="sample_id")) %>%
+  left_join(nutrients_stop,
+            by=c("nutBID_stop"="sample_id")) %>%
+  mutate(`NO3+NO2_diff` = `NO3+NO2_stop`-`NO3+NO2_start`,
+         NH4_diff = NH4_stop-NH4_start,
+         PO4_diff = PO4_stop-PO4_start) %>%
+  select(-c(nutBID_start, NH4_start:`NO3+NO2_stop`))
+
+# sample 8 thawed and values never measured, take median value of other identical current densities
+dat <- dat %>%
+  left_join(dat %>%
+              filter(j==0.5) %>%
+              mutate(across(`NO3+NO2_diff`:PO4_diff,
+                            ~.x/hours)) %>%
+              select(`NO3+NO2_diff`:PO4_diff) %>%
+              summarise(across(everything(), ~median(.x, na.rm=T)*2)) %>%
+              mutate(nutBID_stop = 8, .before = "NO3+NO2_diff"),
+  by="nutBID_stop", suffix=c("","_temp")) %>%
+  mutate(`NO3+NO2_diff` = case_when(is.na(`NO3+NO2_diff`) ~ `NO3+NO2_diff_temp`,
+                                    TRUE ~ `NO3+NO2_diff`),
+         NH4_diff = case_when(is.na(NH4_diff) ~ NH4_diff_temp,
+                              TRUE ~ NH4_diff),
+         PO4_diff =case_when(is.na(PO4_diff) ~ PO4_diff_temp,
+                          TRUE ~ PO4_diff)) %>% 
+  select(-c(nutBID_stop,`NO3+NO2_diff_temp`:PO4_diff_temp))
+
+rm(nutrients, nutrients_start, nutrients_stop)
+
+# add carbonate chemistry data ----
+carb_dat <- read_csv('../data/eAECarbChemIncubations/incubationCarbChem.csv',
+                     na = "NULL") %>%
+  select(sample_num, S= calc_salinity, 
+         DIC = calc_avg_dic_kg_corrected, TA = calc_avg_ta_kg_corrected) %>%
+  left_join(read_csv('../data/eAECarbChemIncubations/incubationSpecPH.csv') %>%
+              select(sample_num, spec_ph_25),
+            by="sample_num") %>%
+  left_join(dat %>%
+              select(sample_num = ccTag_start, T = T_start) %>%
+              distinct() %>%
+              bind_rows(dat %>%
+                          select(sample_num = ccTag_stop, T = T_stop) %>%
+                          distinct()),
+            by = "sample_num") %>%
+  mutate(spec_pH_corrected = pHinsi(pH = spec_ph_25,
+                                    ALK = TA,
+                                    Tinsi = T,
+                                    Tlab = 25,
+                                    S = S),
+         carb(flag = 15,
+              var1 = TA/1000000,
+              var2 = DIC/1000000,
+              S = S,
+              T = T)) %>%
+  select(sample_num:TA, spec_pH = spec_pH_corrected, pH, pCO2,CO2,
+         HCO3:OmegaCalcite)
+
+# join w/ dat
+dat %>%
+  left_join(carb_dat %>%
+              filter(sample_num %in% dat$ccTag_start) %>%
+              rename_with(~ paste(., "start", sep = "_")),
+            by = c("ccTag_start"= "sample_num_start")) %>%
+  left_join(carb_dat %>%
+              filter(sample_num %in% dat$ccTag_stop) %>%
+              rename_with(~ paste(., "stop", sep = "_")),
+            by = c("ccTag_stop"= "sample_num_stop")) %>%
+  #calculate avg salinity
+  rowwise() %>%
+  mutate(S_avg = mean(c(S_start,S_stop))) %>%
+  ungroup() %>%
+  mutate(DIC_diff = (DIC_stop-DIC_start)*1000000,
+         TA_diff = TA_stop - TA_start,
+         spec_pH_diff = (10^(-spec_pH_stop) - 10^(-spec_pH_start))*10^6/(rho(S=S_avg, T=T_avg)/1000), # [H+] umol/kg
+         pH_diff = (10^(-pH_stop) - 10^(-pH_start))*10^6/(rho(S=S_avg, T=T_avg)/1000), #[H+]
+         pCO2_diff = pCO2_stop - pCO2_start,
+         CO2_diff = CO2_stop - CO2_start,
+         HCO3_diff = HCO3_stop - HCO3_start,
+         CO3_diff = CO3_stop - CO3_start,
+         OmegaAragonite_diff = OmegaAragonite_stop - OmegaAragonite_start,
+         OmegaCalcite_diff = OmegaCalcite_stop - OmegaCalcite_start) %>%
+  select(-c(ccTag_start, ccTag_stop)) %>%
+  select(date:T_avg, S_avg, O2_diff:PO4_diff, DIC_diff:OmegaCalcite_diff) -> dat
+
+# output
+write_csv(dat, '../data/eAECarbChemIncubations/incubationDataOutput.csv')
+  
+
+# calculate productivity, calcification, alkalinity enhancement rates ----
+dat %>%
+  mutate(# total alkalinity anomaly technique, 2:1 change in TA (corrected for nutrients) * vol * density * CaCO3 molar mass per hr
+    G = -1*(0.5*TA_diff+PO4_diff-NH4_diff+`NO3+NO2_diff`)*4*(rho(S=S_avg, T=T_avg)/1000)*100/hours/1000,
+    # alkalinity enhancement, total change in 
+    AE = TA_diff/hours*4*rho(S=S_avg, T=T_avg)/1000,
+    # AE corrected by nutrients, identical to TAA
+    AE_nutCor = (TA_diff+PO4_diff-NH4_diff+`NO3+NO2_diff`)/hours*4*rho(S=S_avg, T=T_avg)/1000,
+    DIC = DIC_diff/hours*4*rho(S=S_avg, T=T_avg)/1000,
+    pCO2 = pCO2_diff/hours*4*rho(S=S_avg, T=T_avg)/1000,
+    CO2 = CO2_diff/hours*4*rho(S=S_avg, T=T_avg)/1000,
+    HCO3 = HCO3_diff/hours*4*rho(S=S_avg, T=T_avg)/1000,
+    CO3 = CO3_diff/hours*4*rho(S=S_avg, T=T_avg)/1000,
+    pH = pH_diff/hours*4*rho(S=S_avg, T=T_avg)/1000, # H+ (umol)/hr
+    spec_pH = spec_pH_diff/hours*4*rho(S=S_avg, T=T_avg)/1000,
+    prod_dic = (DIC_diff-(0.5*TA_diff+PO4_diff-NH4_diff+`NO3+NO2_diff`))*4*(rho(S=S_avg, T=T_avg)/1000)/hours,
+    prod_opto = O2_diff*4/hours) -> dat
+
+
+# summarize data by j ----
+# AE
+dat %>%
+  group_by(j) %>%
+  summarise(AE_mean = mean(AE, na.rm=T),
+            AE_sd = sd(AE, na.rm=T)) %>%
+  ungroup() #%>%
+  #mutate(AE_mean = AE_mean - AE_mean[which(j==0)]) #%>%
+  #filter(j!=0) #%>%
+  #write.table("clipboard",sep="\t",row.names=F)
+
+# AE nurient corrected
+dat %>%
+  group_by(j) %>%
+  summarise(AE_nutCor_mean = mean(AE_nutCor, na.rm=T),
+            AE_nutCor_sd = sd(AE_nutCor, na.rm=T)) %>%
+  ungroup() %>%
+  mutate(AE_nutCor_mean = AE_nutCor_mean - AE_nutCor_mean[which(j==0)]) #%>%
+  #filter(j!=0) #%>%
+  #write.table("clipboard",sep="\t",row.names=F)
+
+dat %>%
+  mutate(AE_nutCor = AE_nutCor - 11.345278) %>%
+  group_by(j) %>%
+  summarise(AE_nutCor_mean = mean(AE_nutCor, na.rm=T),
+            AE_nutCor_sd = sd(AE_nutCor, na.rm=T))
+
+# differences is like a mol contributed by organic alkalinity, so pretty negligle
+
+dat %>%
+  mutate(AE_nutCor=AE_nutCor - (11.345278)) %>% # subtract the blank value
+  filter(j!=0) %>%
+  ggplot(aes(as.factor(j), AE_nutCor, fill=as.factor(j))) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set2") + #wes_palette("Moonrise3")) +
+  #scale_fill_manual(values = wes_palette("Royal1")) +
+  labs(x="Current Density",
+       fill = expression("Current Density, " ~ J ~ "("*A~m^-2*")"),
+       y = expression(Delta*"TA "~h^-1 ~ "("*mu*"mol "~h^-1*")")) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        axis.text = element_text(size=14),
+        axis.title = element_text(size=16),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))
+  
+ggsave('../figures/deltaTAplot.tiff',
+       dpi = 600,
+       width = 6,
+       height = 5,
+       units = "in",
+       device = "tiff",
+       compression = "lzw")
+
+# change in DIC
+dat %>%
+  group_by(j) %>%
+  summarise(DIC_mean = mean(DIC, na.rm=T),
+            DIC_sd = sd(DIC, na.rm=T)) %>%
+  ungroup() %>%
+  mutate(DIC_mean = DIC_mean - DIC_mean[which(j==0)])
+
+dat %>%
+  select(j, TA = AE_nutCor, DIC, pCO2, CO2, HCO3, CO3) %>%
+  mutate(TA = TA - 11.345278,
+         DIC = DIC - 6.9028401,
+         pCO2 = pCO2 + 109.951416,
+         CO2 = CO2 +  -1.438846e-06,
+         HCO3 = HCO3 - 4.571499e-06,
+         CO3 = CO3 - 3.770187e-06) %>%
+  filter(j != 0)-> stats
+
+
+stats %>%
+  ungroup()  %>%
+  pivot_longer(TA:CO3,
+               names_to = "param",
+               values_to = "value") %>%
+  mutate(j = as.factor(j)) %>%
+  ggplot(aes(j, value, fill=j)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set2") +
+  facet_wrap(~param, scales = "free") +
+  labs(x=bquote(bold("Current Density, J (A"~m^-2*")")),
+        y = bquote(bold(Delta~h^-1 ~ "("*mu*"mol "~kg^-1~h^-1*")"))) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face = "bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))
+
+ggsave('../figures/incubationCarbChemplot.tiff',
+       dpi = 600,
+       width = 6,
+       height = 5,
+       units = "in",
+       device = "tiff",
+       compression = "lzw")
+
+  
+
+stats %>%
+  aov(CO3 ~ as.factor(j), data=.) %>%
+  summary()
+
+dat %>%
+  select(j, AE_nutCor, DIC, pCO2,CO2, HCO3, CO3) %>%
+  group_by(j) %>%
+  summarise(across(AE_nutCor:CO3, ~mean(.x, na.rm=T))) %>%
+  mutate(across(AE_nutCor:CO3, function(x) {
+    x - x[which(j==0)]
+  })) %>%
+  filter(j != 0)
+
+
+dat %>%
+  select(j, AE_nutCor, DIC, pCO2, HCO3, CO3) %>%
+  group_by(j) %>%
+  summarise(across(AE_nutCor:CO3, ~sd(.x, na.rm=T))) %>%
+  filter(j != 0)
+
+```
+
+# stats
+```{r}
+dat %>%
+  mutate(AE_nutCor=AE_nutCor - 11.345278) %>% # subtract the blank value
+  filter(j!=0) %>%
+  select(date, j, AE_nutCor) -> dat_ae
+
+dat_ae %>%
+  group_by(j) %>%
+  summarise(AE_mean = mean(AE_nutCor),
+            AE_sd = sd(AE_nutCor))
+
+dat_ae %>%
+  aov(AE_nutCor ~ as.factor(j), data=.) -> ae_anovaMod
+
+# **1. Check ANOVA Assumptions**
+# Normality assumption - Shapiro-Wilk test per group
+shapiro.test(residuals(ae_anovaMod))
+
+# **2. Check Homoscedasicity **
+dat_ae %>%
+  car::leveneTest(AE_nutCor ~ as.factor(j), data = .)
+
+# **3. Use anova**
+summary(ae_anovaMod)
+
+TukeyHSD(ae_anovaMod)
+```
+

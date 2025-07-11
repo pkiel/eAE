@@ -1,0 +1,340 @@
+---
+title: "eAE Growth Analysis"
+author: "Patrick Kiel"
+date: "2024-05-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F)
+
+# load libraries
+library(tidyverse)
+library(openxlsx)
+library(seacarb)
+library(lme4)
+library(emmeans)
+library(lsmeans)
+library(lmerTest)
+library(rstatix)
+library(wesanderson)
+library(ggpubr)
+library(grid)
+```
+
+```{r, load-data}
+#load tank assignment + genotype data
+tankAssignment <- read_csv('../data/microfragExperiment/tankAssignment.csv') %>%
+  mutate(id = paste("F", id, sep=""))
+
+sa <- read_csv('../data/microfragExperiment/surfaceArea.csv') %>%
+  mutate(id = paste("F", id, sep=""))
+
+bw <- read_csv('../data/microfragExperiment/bwData.csv') %>%
+  mutate(date = parse_date(date, format="%m/%d/%Y"))
+
+bw %>%
+  left_join(tankAssignment, by=c("id")) %>%
+  left_join(sa, by=c("id")) %>%
+  arrange(tank, genotype,id,date) %>%
+#calculate weight in air
+  mutate(
+    #calculate sw density (g/cm3) from YSI, p taken as std atm p
+    density = rho(S = salinity,
+                  T = temperature)/1000,
+    #calculate weight in air using Jokiel et al. 1978 eqn
+    mass_a = mass/(1-density/2.93)) -> bw
+```
+
+```{r, calculate-weeklyMeans}
+#calculate total growth
+growth <- bw %>%
+  #remove standards
+  drop_na(genotype,mass_a) %>%
+  arrange(id, date) %>%
+  group_by(id,genotype,tank, substrate, height, sa.cm2) %>%
+  mutate(mass_diff = mass_a - lag(mass_a),
+         days_diff = as.numeric(date - lag(date))) %>%
+  filter(days_diff>0) %>%
+  ungroup() %>%
+  mutate(dailyMassGain = mass_diff*1000/days_diff,
+         G = dailyMassGain/sa.cm2,
+         substrate = case_when(genotype == "blank" ~ "eAE Bare",
+                               T ~ substrate),
+         substrate = factor(substrate,
+                            levels = c("inert",
+                                       "eAE Bare",
+                                       "eAE")),
+         height = case_when(height == "blank" ~ "eAE Bare",
+                            TRUE ~ height)) %>%
+  group_by(id) %>%
+  mutate(time = row_number()) %>%
+  ungroup()
+```
+
+
+```{r, calculate means}
+growth %>%
+  group_by(substrate, height) %>%
+  summarise(dailyG = mean(dailyMassGain, na.rm=T),
+            dailyG_sd = sd(dailyMassGain, na.rm=T),
+            .groups="drop")
+
+growth %>%
+ filter(substrate == "inert") %>%
+  group_by(substrate, height) %>%
+  summarise(dailyG = mean(G, na.rm=T),
+            dailyG_sd = sd(G, na.rm=T),
+            .groups="drop")
+
+growth %>%
+  filter(substrate == "eAE") %>%
+  mutate(dailyMassGain = dailyMassGain - 24.937775,
+         G = dailyMassGain/sa.cm2,
+         substrate = "eAE Coral Adjusted") %>%
+  bind_rows(growth %>%
+              filter(substrate == "eAE") %>%
+              mutate(substrate = "eAE Coral")) %>%
+  bind_rows(growth %>%
+              filter(substrate != "eAE")) -> growth_final
+
+# Set factor levels
+growth_final$substrate <- ifelse(growth_final$substrate == "inert",
+                                 "Inert", 
+                                 growth_final$substrate)
+growth_final$substrate <- factor(growth_final$substrate,
+                                 levels = c("eAE Coral", "eAE Bare",
+                                            "eAE Coral Adjusted", "Inert"))
+
+growth_final %>%
+  filter(substrate == "eAE Coral Adjusted") %>%
+  group_by(substrate, height) %>%
+  summarise(dailyG = mean(dailyMassGain, na.rm=T),
+            dailyG_sd = sd(dailyMassGain, na.rm=T),
+            .groups="drop")
+
+growth_final %>%
+  filter(substrate == "eAE Coral Adjusted") %>%
+  group_by(substrate, height) %>%
+  summarise(dailyG = mean(G, na.rm=T),
+            dailyG_sd = sd(G, na.rm=T),
+            .groups="drop")
+
+```
+
+# plots
+```{r}
+# skip the blue for Moonrise3 palette
+moonrise_colors <- c(wes_palette("Moonrise3")[3:5], wes_palette("Moonrise3")[2])
+moonrise_colors_g <- c(rep(c(wes_palette("Moonrise3")[5], wes_palette("Moonrise3")[2]),2))
+
+panel_a <- growth_final %>%
+  filter(height == "short" | substrate == "eAE Bare") %>%
+  ggplot(aes(substrate,dailyMassGain,fill=substrate)) +
+  geom_boxplot(notch = F) +
+  scale_fill_manual(values = moonrise_colors) +
+  labs(x = "Fragment Height",
+       #y = expression("Daily Growth Rate (mg "~day^-1*")"),
+       y = bquote(bold("Daily Growth Rate (mg "~day^-1*")")),
+       fill = "Substrate") +
+  annotate("text", 
+           x = Inf, y = Inf, 
+           label = "Short", 
+           hjust = 1.2, vjust = 1.6, 
+           size = 5, fontface = "bold") +
+  theme_bw() +
+  theme(legend.position = "none",
+        legend.title = element_text(size = 10, face = "bold"),
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+panel_b <- growth_final %>%
+  filter(height == "short") %>%
+  filter(substrate %in% c("Inert", "eAE Coral Adjusted")) %>%
+  ggplot(aes(substrate,G,fill=substrate)) +
+  geom_boxplot(notch = F) +
+  scale_fill_manual(values = moonrise_colors_g) +
+  scale_y_continuous(limits = c(0,1), breaks=seq(0,1,by=0.25),
+                     expand = expansion(add = c(0.05,0.3))) +
+  labs(x = "Fragment Height",
+       y = bquote(bold("Daily Calcification Rate (mg "~cm^-2~day^-1*")"))) +
+  annotate("text", 
+         x = Inf, y = Inf, 
+         label = "Short", 
+         hjust = 1.2, vjust = 1.6, 
+         size = 5, fontface = "bold") +
+  theme_bw() +
+ theme(legend.position = "none",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+panel_c <- growth_final %>%
+  filter(height == "tall"| substrate == "eAE Bare") %>%
+  ggplot(aes(substrate,dailyMassGain,fill=substrate)) +
+  geom_boxplot(notch = F) +
+  scale_fill_manual(values = moonrise_colors) +
+  labs(x = "Fragment Height",
+       #y = expression("Daily Growth Rate (mg "~day^-1*")"),
+       y = bquote(bold("Daily Growth Rate (mg "~day^-1*")")),
+       fill = "Substrate") +
+  annotate("text", 
+         x = Inf, y = Inf, 
+         label = "Tall", 
+         hjust = 1.4, vjust = 1.6, 
+         size = 5, fontface = "bold") +
+  theme_bw() +
+  theme(legend.position = "none",
+        legend.title = element_text(size = 10, face = "bold"),
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+panel_d <- growth_final %>%
+  filter(height == "tall") %>%
+  filter(substrate %in% c("Inert", "eAE Coral Adjusted")) %>%
+  ggplot(aes(substrate,G,fill=substrate)) +
+  geom_boxplot(notch = F) +
+  scale_fill_manual(values = moonrise_colors_g) +
+   scale_y_continuous(limits = c(0,1), breaks=seq(0,1,by=0.25)) +
+  labs(x = "Fragment Height",
+       y = bquote(bold("Daily Calcification Rate (mg "~cm^-2~day^-1*")"))) +
+  annotate("text", 
+       x = Inf, y = Inf, 
+       label = "Tall", 
+       hjust = 1.4, vjust = 1.6, 
+       size = 5, fontface = "bold") +
+  theme_bw() +
+ theme(legend.position = "none",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+# combine the plots
+ggarrange(panel_a + rremove("xlab") + rremove("ylab"),  
+          panel_c + rremove("xlab") + rremove("ylab"),
+          labels = c("A","C"),
+          ncol = 1, nrow = 2) -> figure_left
+
+annotate_figure(figure_left,
+                left = text_grob(bquote(bold("Daily Growth Rate ("*mg~day^-1*")")),
+                                 rot = 90, face = "bold", size=12)) -> figure_left
+
+ggarrange(panel_b + rremove("xlab") + rremove("ylab"), 
+          panel_d + rremove("xlab") + rremove("ylab"), 
+          labels = c("B","D"),
+          hjust = 1,
+          ncol = 1, nrow = 2) -> figure_right
+
+annotate_figure(figure_right,
+                left = text_grob(bquote(bold("Daily Calcification Rate ("*mg~cm^-2~day^-1*")")),
+                                 rot = 90, face = "bold", size=12,
+                                  x = unit(-0.07, "npc"))) -> figure_right
+
+ggarrange(figure_left,
+          NULL,
+          figure_right,
+          ncol = 3, nrow = 1,
+          widths = c(3,0.07,2)) -> figure_combined
+
+annotate_figure(figure_combined,
+                bottom = text_grob("Substrate", face = "bold", size = 14, hjust = -0.5))
+
+# ggsave('../figures/pclivGrowthPlot.tiff',
+#        width = 10, height=5, dpi=600,
+#        units = "in",
+#        device = "tiff", compression ="lzw")
+```
+
+#stats
+```{r,}
+growth_final %>%
+  filter(substrate %in% c("Inert", "eAE Coral Adjusted")) -> growth_stats
+
+ggplot(growth_stats, aes(sample = (G))) +
+  stat_qq() + 
+  stat_qq_line() +
+  theme_minimal() +
+  labs(title = "QQ Plots for Daily Calcification Rate", x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+# proceed with lmer to account for repeated measures
+mod <- lmer(G ~ substrate*height + (1 | tank) + (1 | id),
+              data = growth_stats)
+shapiro.test(residuals(mod)) # residuals are normal, agrees w/ QQQ
+boxplot(residuals(mod) ~ growth_stats$height) # homoscedascity 
+anova(mod)
+summary(mod)
+marginal = emmeans(mod, ~ substrate*height)
+pairs(marginal, adjust="tukey") %>%
+  broom::tidy()
+
+
+#Check for genet effect, nothing
+mod <- lmer(G ~ genotype + (1| substrate) + (1|height) + (1 | tank) + (1 | id),
+              data = growth_stats)  
+summary(mod) 
+#Check for tank effect, nothing
+mod <- lmer(G ~ tank + (1| substrate) + (1|height) + (1 | genotype) + (1 | id),
+              data = growth_stats)  
+summary(mod) 
+```
+
+# compare abiotic precipitation rates between experiments
+```{r}
+growth_final %>%
+  ungroup() %>%
+  filter(substrate == "eAE Bare") %>%
+  mutate(experiment = "microfrag") %>%
+  select(date, id, tank, dailyMassGain, experiment) %>%
+  bind_rows(
+    read_csv('../data/microfragExperiment/abioticG_compare_acerExpData.csv') %>%
+      select(date, id=tag, dailyMassGain, tank, experiment) %>%
+      mutate(id = as.character(id),
+             tank = as.character(tank))
+  ) -> eAEBare
+
+mod <- lmer(dailyMassGain ~ experiment + (1| tank) + (1 | id),
+              data = eAEBare) 
+# all good
+ggplot(eAEBare, aes(sample = (dailyMassGain))) +
+  stat_qq() + 
+  stat_qq_line() +
+  theme_minimal() +
+  labs(title = "QQ Plots for Daily Calcification Rate", x = "Theoretical Quantiles", y = "Sample Quantiles")
+boxplot(residuals(mod) ~ eAEBare$experiment) # homoscedascity yes
+summary(mod)
+```
+

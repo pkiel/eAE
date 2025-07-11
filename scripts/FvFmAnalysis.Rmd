@@ -1,0 +1,123 @@
+---
+title: "Photochemical efficiency Analysis"
+output: html_notebook
+---
+
+## Load packages
+```{r load-packages}
+library(tidyverse)
+library(wesanderson)
+library(lme4)
+library(emmeans)
+library(lsmeans)
+library(lmerTest)
+library(rstatix)
+```
+
+## Import Data
+```{r import-data}
+ipam <- read_csv('../data/microfragExperiment/FvFmData.csv')
+tankAssignment <- read_csv('../data/microfragExperiment/tankAssignment.csv') %>%
+  mutate(id = paste0("F", id))
+
+ipam %>%
+  left_join(tankAssignment, by=c("tag"="id")) -> ipam
+```
+
+## plot data
+```{r}
+moonrise_subset <- c(rep(c(wes_palette("Moonrise3")[5], wes_palette("Moonrise3")[2]),2))
+
+ipam %>%
+  ggplot(aes(substrate, YII, fill=substrate)) +
+  geom_boxplot() +
+  scale_fill_manual(values = moonrise_subset) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+ipam %>%
+  ggplot(aes(substrate, YII, fill=substrate)) +
+  geom_boxplot() +
+  scale_fill_manual(values = moonrise_subset) +
+  facet_wrap(~height) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# geno 8 is driving things low
+ipam %>%
+  ggplot(aes(genotype, YII, fill=genotype)) +
+  geom_boxplot() +
+  labs(y = bquote(bold("Photochemical Efficiency Fv"~Fm^-1)),
+       x = "Genet") +
+  theme_bw() +
+   theme(legend.position = "none",
+        panel.border = element_rect(linewidth = 1),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent', color = NA, col=0), #transparent legend bg
+        axis.text = element_text(size=10),
+        axis.title = element_text(size=12, face="bold"),
+        plot.caption.position = "plot",  # Moves caption inside the plot (bottom-left)
+        plot.caption = element_text(hjust = 0, size = 10))  # Left-align & increase font size)
+
+
+ggsave('../figures/pclivPhotochemicalEfficiency.tiff',
+       width = 10, height=5, dpi=600,
+       units = "in",
+       device = "tiff", compression ="lzw")
+```
+
+## stats
+```{r}
+mod <- lmer(YII ~ substrate * height + (1|tank) + (1 | genotype), data=ipam)
+
+# residuals do not look normal
+ggplot(ipam, aes(sample = (YII))) +
+  stat_qq() + 
+  stat_qq_line() +
+  theme_minimal() +
+  labs(title = "QQ Plots for Planar Areas", x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+shapiro.test(residuals(mod)) # residuals are normal
+boxplot(residuals(mod) ~ ipam$substrate*ipam$height) # homoscedascity 
+
+# Model summary
+summary(mod)
+
+# Estimated marginal means slopes for pairwise comparisons
+estimatedMeans <- emmeans(mod, ~ substrate * height)
+
+# Pairwise comparisons of slopes
+pairwise_comparisons <- pairs(estimatedMeans, adjust="tukey")
+
+# Display results
+estimatedMeans %>%
+  broom::tidy() %>%
+  mutate(SD = std.error * sqrt(df),
+         .after= "estimate")
+pairwise_comparisons
+
+mod <- aov(YII ~ genotype, data=ipam)
+# Model summary
+summary(mod)
+
+# Estimated marginal means slopes for pairwise comparisons
+estimatedMeans <- emmeans(mod, ~ genotype)
+
+# Pairwise comparisons of slopes
+pairwise_comparisons <- pairs(estimatedMeans, adjust="tukey")
+
+# Display results
+estimatedMeans %>%
+  broom::tidy() %>%
+  mutate(SD = std.error * sqrt(df),
+         .after= "estimate")
+pairwise_comparisons %>%
+  broom::tidy() %>%
+  filter(adj.p.value < 0.05) %>%
+  mutate(std.error * sqrt(df))
+```
+
